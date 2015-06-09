@@ -1,35 +1,28 @@
 -- Copyright (C) 2012 Yichun Zhang (agentzh)
+-- Copyright (C) 2015 daurnimator
 
-
-local bit = require "bit"
+local cs = require "cqueues.socket"
+local bit = require "bit32"
 local sub = string.sub
-local tcp = ngx.socket.tcp
 local strbyte = string.byte
 local strchar = string.char
 local strfind = string.find
 local format = string.format
 local strrep = string.rep
-local null = ngx.null
+local null = nil
 local band = bit.band
 local bxor = bit.bxor
 local bor = bit.bor
 local lshift = bit.lshift
 local rshift = bit.rshift
 local tohex = bit.tohex
-local sha1 = ngx.sha1_bin
+local new_digest = require "openssl.digest".new
+local function sha1(str) return new_digest("SHA1"):final(str) end
 local concat = table.concat
 local unpack = unpack
 local setmetatable = setmetatable
 local error = error
 local tonumber = tonumber
-
-
-if not ngx.config
-   or not ngx.config.ngx_lua_version
-   or ngx.config.ngx_lua_version < 9011
-then
-    error("ngx_lua 0.9.11+ required")
-end
 
 
 local ok, new_tab = pcall(require, "table.new")
@@ -193,14 +186,14 @@ local function _send_packet(self, req, size)
 
     -- print("sending packet... of size " .. #packet)
 
-    return sock:send(packet)
+    return sock:write(packet)
 end
 
 
 local function _recv_packet(self)
     local sock = self.sock
 
-    local data, err = sock:receive(4) -- packet header
+    local data, err = sock:read(4) -- packet header
     if not data then
         return nil, nil, "failed to receive packet header: " .. err
     end
@@ -225,7 +218,7 @@ local function _recv_packet(self)
 
     self.packet_no = num
 
-    data, err = sock:receive(len)
+    data, err = sock:read(len)
 
     --print("receive returned")
 
@@ -467,11 +460,7 @@ end
 
 
 function _M.new(self)
-    local sock, err = tcp()
-    if not sock then
-        return nil, err
-    end
-    return setmetatable({ sock = sock }, mt)
+    return setmetatable({ sock = nil }, mt)
 end
 
 
@@ -487,9 +476,7 @@ end
 
 function _M.connect(self, opts)
     local sock = self.sock
-    if not sock then
-        return nil, "not initialized"
-    end
+    assert(sock == nil, "already initialized")
 
     local max_packet_size = opts.max_packet_size
     if not max_packet_size then
@@ -504,40 +491,28 @@ function _M.connect(self, opts)
     local database = opts.database or ""
     local user = opts.user or ""
 
-    local pool = opts.pool
-
     local host = opts.host
+
+    local connect_arg = {
+        verify = opts.ssl_verify;
+    }
     if host then
         local port = opts.port or 3306
-        if not pool then
-            pool = user .. ":" .. database .. ":" .. host .. ":" .. port
-        end
-
-        ok, err = sock:connect(host, port, { pool = pool })
-
+        connect_arg.host = host
+        connect_arg.port = port
     else
         local path = opts.path
         if not path then
             return nil, 'neither "host" nor "path" options are specified'
         end
-
-        if not pool then
-            pool = user .. ":" .. database .. ":" .. path
-        end
-
-        ok, err = sock:connect("unix:" .. path, { pool = pool })
+        connect_arg.path = path;
     end
-
-    if not ok then
+    sock, err = cs.connect(connect_arg)
+    if not sock then
         return nil, 'failed to connect: ' .. err
     end
-
-    local reused = sock:getreusedtimes()
-
-    if reused and reused > 0 then
-        self.state = STATE_CONNECTED
-        return 1
-    end
+    sock:setmode("b", "bn")
+    self.sock = sock
 
     local packet, typ, err = _recv_packet(self)
     if not packet then
@@ -632,7 +607,7 @@ function _M.connect(self, opts)
             return nil, "failed to send client authentication packet: " .. err
         end
 
-        local ok, err = sock:sslhandshake(false, nil, ssl_verify)
+        local ok, err = sock:starttls()
         if not ok then
             return nil, "failed to do ssl handshake: " .. (err or "")
         end
@@ -689,32 +664,6 @@ function _M.connect(self, opts)
 end
 
 
-function _M.set_keepalive(self, ...)
-    local sock = self.sock
-    if not sock then
-        return nil, "not initialized"
-    end
-
-    if self.state ~= STATE_CONNECTED then
-        return nil, "cannot be reused in the current connection state: "
-                    .. (self.state or "nil")
-    end
-
-    self.state = nil
-    return sock:setkeepalive(...)
-end
-
-
-function _M.get_reused_times(self)
-    local sock = self.sock
-    if not sock then
-        return nil, "not initialized"
-    end
-
-    return sock:getreusedtimes()
-end
-
-
 function _M.close(self)
     local sock = self.sock
     if not sock then
@@ -722,6 +671,7 @@ function _M.close(self)
     end
 
     self.state = nil
+    self.sock = nil
 
     return sock:close()
 end
